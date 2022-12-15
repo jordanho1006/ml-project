@@ -1,0 +1,395 @@
+#downloading dataset directly from kaggle api into my Amazon S3 Bucket
+aws s3api create-bucket --bucket my-data-bucket-vtuber --region us-east-2 \
+--create-bucket-configuration LocationConstraint=us-east-2
+
+pip3 install kaggle
+mkdir .kaggle
+nano .kaggle/kaggle.json
+{"username":"x**********3","key":"3***********************5"}
+chmod 600 .kaggle/kaggle.json
+kaggle datasets list
+
+nano  ~/.local/lib/python3.7/site-packages/kaggle/api/kaggle_api_extended.py
+Change line 1582 from:
+if not os.path.exists(outpath):
+to
+if not os.path.exists(outpath) and outpath != "-":
+Change line 1594 From:
+with open(outfile, 'wb') as out:
+to
+with open(outfile, 'wb') if outpath != "-" else os.fdopen(sys.stdout.fileno(), 'wb', closefd=False) as out:
+Lastly, to download the data, the following command was entered:
+kaggle datasets download --quiet -d uetchy/vtuber-livechat -p -  | aws s3 cp - s3://my-data-bucket-vtuber/vtuber livechat.zip
+kaggle datasets download --quiet -d uetchy/vtuber-livechat-elements -p -  | aws s3 cp - s3://my-data-bucket-vtuber/vtuber-livechat-statistics.zip
+
+#importing relevant libraries
+import zipfile
+import boto3
+from io import BytesIO
+
+#this is done twice since there are two different zip files (“vtuber-livechats.zip” and vtuber-livechat-statistics.zip”)
+bucket="my-data-bucket-vtuber"
+zipfile_to_unzip="vtuber-livechat.zip"
+ 
+#creating an s3 client and resource that will allow us to access the objects stored in our S3 environment
+s3_client = boto3.client('s3', use_ssl=False)
+s3_resource = boto3.resource('s3')
+
+#creating a zip object that represents the zip file
+zip_obj = s3_resource.Object(bucket_name=bucket, key=zipfile_to_unzip)
+buffer = BytesIO(zip_obj.get()["Body"].read())
+z = zipfile.ZipFile(buffer)
+# Loop through all of the files contained in the Zip archive
+for filename in z.namelist():
+	print('Working on ' + filename)
+	# Unzip the file and write it back to S3 in the same bucket
+	s3_resource.meta.client.upload_fileobj(z.open(filename), Bucket=bucket, Key=f'{filename}')
+
+#reading/cleaning the dataset to fit my requirements
+#importing relevant libraries
+import boto3
+import pandas as pd
+import glob
+import io
+    
+#creating an s3 resource that will allow us to access the objects stored in our S3 environment
+s3 = boto3.resource(
+    service_name='s3',
+    region_name='us-east-2',
+    aws_access_key_id='A******************5',
+    aws_secret_access_key='P********************************g'
+)
+
+#print out bucket names
+for bucket in s3.buckets.all():
+    print(bucket.name)
+vtuber_bucket = s3.Bucket('my-data-bucket-vtuber')
+
+vtuber_df = pd.DataFrame()
+for object in vtuber_bucket.objects.all():
+    if object.key.startswith('superchats_'):
+        buffer = io.BytesIO()
+        obj = s3.Object('my-data-bucket-vtuber', object.key)
+        obj.download_fileobj(buffer)
+        vtuber_df = vtuber_df.append(pd.read_parquet(buffer, engine='fastparquet'))
+vtuber_df
+
+#creating a dataframe with the channels csv file to merge with the dataset
+channels_df = pd.read_csv('s3://my-data-bucket-vtuber/channels.csv')
+channels_df
+
+vtuber_df = pd.merge(vtuber_df, channels_df, how='left', on='channelId')
+vtuber_df['timestamp'] = pd.to_datetime(vtuber_df['timestamp'], utc=True)
+
+vtuber_df.info()
+
+#creating a dataframe with only those affiliated with Hololive Production
+hololive_df = vtuber_df.loc[vtuber_df['affiliation'] == 'Hololive']
+
+#creating a list of VTuber's channel names in English
+hololive_df_EN = hololive_df['englishName'].unique().tolist()
+
+#creating a list of names that are affiliated with Hololive but not technically members and removing them
+retired = ['Uruha Rushia', 'Kiryu Coco']
+official_channel = ['Hololive Vtuber Group']
+remove_list = retired + official_channel
+
+#create a new column and to turn timestamps into the proper MM-YYYY format
+hololive_df['timestamp'] = pd.to_datetime(hololive_df['timestamp'], utc=True)
+hololive_df['date'] = hololive_df['timestamp'].dt.strftime('%m-%Y')
+
+for channel in hololive_df_EN:
+	if channel in remove_list:
+		hololive_df_EN.remove(channel)
+
+
+for name in hololive_df_EN:
+	print(name)
+
+len(hololive_df_EN)
+
+hololive_df.describe()
+
+#uploading the file onto my Amazon EMR Cluster to process more quickly and more easily
+hdfs dfs -mkdir hdfs:///myfiles
+curl -SL https://my-data-bucket-vtuber.s3.us-east-2.amazonaws.com/hololive_df.csv | hdfs dfs -put -f -  hdfs:///myfiles/hololive_df.csv
+pyspark
+
+sc.setLogLevel(“ERROR”)
+sc.version
+path = “hdfs:///myfiles/hololive_df.csv”
+hololive_sdf = spark.read.csv(path, header = ‘true’, inferSchema = True)
+hololive_sdf.printSchema()
+
+hololive_sdf.count()
+
+hololive_sdf.summary.show() 
+
+#identifying which Vtubers belong to which generation
+#interesting point, some 1st Generation members are given null for group instead of "1st Generation"
+hololive_sdf.select(hololive_sdf[‘englishName’], hololive_sdf[‘group’]).distinct().show() 
+
+#importing relavant libraries for feature engineering and machine learning
+from pyspark.sql.functions import *
+from pyspark.ml.feature import StringIndexer, OneHotEncoder, VectorAssembler
+from pyspark.ml import Pipeline
+# Import the logistic regression model
+from pyspark.ml.classification import LogisticRegression, LogisticRegressionModel
+# Import the evaluation module
+from pyspark.ml.evaluation import *
+# Import the model tuning module
+from pyspark.ml.tuning import *
+import numpy as np
+
+#checking to see any other columns have NULL values
+hololive_sdf.select([count(when(isnan(c) | col(c).isNull(), c)).alias(c) for c in
+["amount","significance","name","englishName","affiliation","group","subscriptionCount","videoCount"]] ).show()
+
+#checking which individuals have NULL values for the group column
+hololive_sdf.select('englishName').filter("group is NULL").distinct().show()
+
+#only VTubers in the 1st Generation seemed to have NULL values
+
+#replacing all NULL values in group with "1st Generation" and saving it to a CSV file
+hololive_df.fillna("1st Generation", inplace=True)
+hololive_df.to_csv('hololive_df.csv', index=False)
+
+#rechecking to see if data in the columns have NULL values
+hololive_sdf = spark.read.csv("hololive_df.csv",header='true',inferSchema= True)
+
+hololive_sdf.select([count(when(isnan(c) | col(c).isNull(), c)).alias(c) for c in
+["amount","significance","name","englishName","affiliation","group","subscriptionCount","videoCount"]] ).show()
+
+#counting and sorting the number of superchat donations each Vtuber recieved in this dataset
+hololive_sdf.groupBy("englishName").count().sort(desc("count")).show()
+
+hololive_sdf.groupBy(“englishName”,”currency”).agg({‘amount’:’mean’}).orderBy(“englishName”).collect()  
+
+hololive_sdf.select(“subscriptionCount”,”videoCount”,”significance”).summary(“count”,”min”,”max”,”mean”).show() 
+
+hololive_sdf.select('englishName','currency','significance','group').show(n=16,truncate=False)  
+
+#applying feature engineering and machine learning to my data
+#assigning indexes for each unique string in a column
+indexer = StringIndexer(inputCols=['englishName','currency','significance','group'], outputCols=['englishNameIndex','currencyIndex','significanceIndex', 'groupIndex'])
+indexed_sdf = indexer.fit(hololive_sdf).transform(hololive_sdf)
+encoder = OneHotEncoder(inputCols=['englishNameIndex','currencyIndex','significanceIndex', 'groupIndex'], outputCols=['englishNameVector','currencyVector','significanceVector','groupVector'], dropLast=False)
+
+#how to read a vector [length of vector, position, occurences]
+model = encoder.fit(indexed_sdf)
+encoded_sdf = model.transform(indexed_sdf)
+assembler = VectorAssembler(inputCols=['currencyVector','significanceVector','groupVector'],
+outputCol="features")
+assembled_sdf = assembler.transform(encoded_sdf)
+assembled_sdf.select(['groupVector','currencyVector','significanceVector', 'features']).show (n=16,truncate=False) 
+
+model = encoder.fit(indexed_sdf)
+encoded_sdf = model.transform(indexed_sdf)
+assembler = VectorAssembler(inputCols=['englishNameVector','currencyVector','significanceVector','groupVector'],
+outputCol="features")
+assembled_sdf = assembler.transform(encoded_sdf)
+assembled_sdf.select(['englishName','englishNameVector','group','groupVector','currencyVector','significanceVector', 'features']).show (n=16,truncate=False) 
+
+#creating a label, if significance is higher than 5 =1.0, otherwise =0.0
+hololive_sdf = hololive_sdf.withColumn("label", when(hololive_sdf.significance < 5, 0.0).otherwise(1.0) )
+
+#creating an indexer for the four string based columns
+indexer = StringIndexer(inputCols=["englishName", "group", "date","currency"], outputCols=["englishNameIndex",
+"groupIndex", "dateIndex","currencyIndex"])
+
+#creating an encoder for the string indexes
+encoder = OneHotEncoder(inputCols=["englishNameIndex", "groupIndex", "dateIndex", "currencyIndex"],
+outputCols=["englishNameVector", "groupVector", "dateVector", "currencyVector" ],
+dropLast=False)
+
+#creating an assembler for the individual feature vectors and the float/double columns
+assembler = VectorAssembler(inputCols=["englishNameVector", "groupVector", "dateVector", "currencyVector",
+"amount","subscriptionCount"], outputCol="features")
+
+#creating the pipline and transforming the data
+hololive_pipe = Pipeline(stages=[indexer, encoder, assembler])
+transformed_sdf = hololive_pipe.fit(hololive_sdf).transform(hololive_sdf)
+transformed_sdf.select('englishName','group','date','amount','currency','significance','label','subscriptionCount','features').show(20, truncate=False)
+
+# Split the data into training and test sets
+trainingData, testData = transformed_sdf.randomSplit([0.7, 0.3])
+# Create a LogisticRegression Estimator
+lr = LogisticRegression()
+# Fit the model to the training data
+model = lr.fit(trainingData)
+
+# Show model coefficients and intercept
+print("Coefficients: ", model.coefficients)
+print("Intercept: ", model.intercept)
+ 
+# Test the model on the testData
+test_results = model.transform(testData)
+# Show the test results
+test_results.select('date','englishName','group','currency','rawPrediction','probability','prediction',
+'label').show(truncate=False)
+ 
+# Create a BinaryClassificationEvaluator to evaluate how well the model works
+evaluator = BinaryClassificationEvaluator(metricName="areaUnderROC")
+# Create the parameter grid (empty for now)
+grid = ParamGridBuilder().build()
+# Create the CrossValidator
+cv = CrossValidator(estimator=lr, estimatorParamMaps=grid, evaluator=evaluator, numFolds=3 )
+# Use the CrossValidator to Fit the training data
+cv = cv.fit(trainingData)
+# Show the average performance over the three folds
+cv.avgMetrics
+ 
+# Evaluate the test data using the cross-validator model
+# Reminder: We used Area Under the Curve
+evaluator.evaluate(cv.transform(testData))
+ 
+# Test the predictions
+predictions = cv.transform(testData)
+# Calculate AUC
+auc = evaluator.evaluate(predictions)
+print('AUC:', auc)
+ 
+# Create the confusion matrix
+predictions.groupby('label').pivot('prediction').count().fillna(0).show()
+ 
+cm = predictions.groupby('label').pivot('prediction').count().fillna(0).collect()
+def calculate_precision_recall(cm):
+	tn = cm[0][2]
+	fp = cm[1][2]
+	fn = cm[0][1]
+	tp = cm[1][1]
+	precision = tp / ( tp + fp )
+	recall = tp / ( tp + fn )
+	accuracy = ( tp + tn ) / ( tp + tn + fp + fn )
+	f1_score = 2 * ( ( precision * recall ) / ( precision + recall ) )
+	return accuracy, precision, recall, f1_score
+print( calculate_precision_recall(cm) )
+ 
+parammap = cv.bestModel.extractParamMap()
+for p, v in parammap.items():
+	print(p, v)
+ 
+# Creating an visual of the ROC curve:
+import io
+import s3fs
+import matplotlib.pyplot as plt
+
+# Grabbing the model
+mymodel = cv.bestModel
+plt.figure(figsize=(6,6))
+plt.plot([0, 1], [0, 1], 'r--')
+x = mymodel.summary.roc.select('FPR').collect()
+y = mymodel.summary.roc.select('TPR').collect()
+plt.scatter(x, y)
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title("ROC Curve")
+
+# Create a buffer to hold the figure
+img_data = io.BytesIO()
+# Write the figure to the buffer
+plt.savefig(img_data, format='png', bbox_inches='tight')
+img_data.seek(0)
+# Connect to the s3fs file system
+s3 = s3fs.S3FileSystem(anon=False)
+with s3.open('s3://my-data-bucket-vtuber/holo_roccurve.png', 'wb') as f:
+	f.write(img_data.getbuffer())
+
+#importing relavant libraries for creating data visualizations
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+df_overlap = pd.DataFrame(columns=channel_names)
+value = []
+for i in range(len(channel_names)) :
+    this_column = df_overlap.columns[i]
+    Left = channel_names[i]
+    value = []
+    for x in channel_names :
+        Bucket1 = hololive_df.loc[hololive_df['englishName'] == Left]
+        Left_Viewer = Bucket1['authorChannelId'].unique().tolist()
+        
+        Right = x
+        Bucket2 = hololive_df.loc[hololive_df['englishName'] == Right]
+        Right_Viewer = Bucket2['authorChannelId'].unique().tolist()
+
+        Intersect = set(Left_Viewer).intersection(Right_Viewer)
+        if len(Left_Viewer) == 0 :
+            value.append(0)
+        else :
+            value.append((len(Intersect)*100)/(len(Left_Viewer)))
+        
+    df_overlap[this_column] = value
+
+df_overlap.index = channel_names
+df_overlap 
+ 
+#creating a matrix from df_overlap to see the percentage of superchats shared amongst the Hololive members
+fig, ax = plt.subplots(figsize=(20,20))  
+sns.heatmap(df_overlap,cmap="YlGnBu", annot=True)
+plt.savefig("correlationmaxtrix_superchats_matplotlib.png")
+plt.show()
+ 
+#grouping superchats by month and converting the data into Pandas
+hololive_plot = hololive_sdf.where(substring('date',4,8) == '2021').groupby("date") \
+.count().sort("date").toPandas()
+
+#creating a line graph that shows the number of superchats throughout 2021
+fig = plt.figure()
+plt.plot(hololive_plot['date'], hololive_plot['count'],color = 'aquamarine')
+plt.xlabel("Year-Month", fontsize=12)
+plt.ylabel("Number of Superchats", fontsize=13)
+plt.title("Total Number of Superchats by Month in 2021", fontsize=15)
+plt.xticks(rotation=90, ha='right')
+fig.tight_layout()
+plt.savefig("monthly_2021_superchatearnings_matplotlib.png")
+plt.show()
+ 
+#grouping superchats by month and converting the data into Pandas
+hololive_plot = hololive_sdf.where(substring('date',4,8) == '2022').groupby("date") \
+.count().sort("date").toPandas()
+#creating a line graph that shows the number of superchats throughout 2022
+fig = plt.figure()
+plt.plot(hololive_plot['date'], hololive_plot['count'],color = 'lightskyblue')
+plt.ylabel("Year-Month", fontsize=12)
+plt.xlabel("Number of Superchat", fontsize=13)
+plt.title("Total Number of Superchat by Month in 2022", fontsize=15)
+plt.xticks(rotation=90, ha='right')
+fig.tight_layout()
+plt.savefig("monthly_2022_superchatearnings_matplotlib.png")
+plt.show()
+
+#grouping the Hololive members by generation
+hololive_bar = hololive_sdf.groupby('group').avg().sort('group').toPandas()
+fig = plt.figure()
+#creating a bar graph that shows average superchat significance within Hololive
+plt.bar(hololive_bar['group'],hololive_bar['avg(significance)'], color = 'lightcoral' )
+plt.xlabel("Hololive Generations", fontsize=12)
+plt.ylabel("Superchat Significance", fontsize=13)
+plt.title("Average Superchat Significance for each Generation", fontsize=15)
+plt.xticks(rotation=90, ha='right')
+plt.savefig("barchart_avgsignificance_matplotlib.png")
+plt.show()
+ 
+#creating a bar graph to show the average superchat significance
+hololive_bar = hololive_sdf.groupby('group').sum().sort('group').toPandas()
+fig = plt.figure()
+plt.bar(hololive_bar['group'],hololive_bar['sum(subscriptionCount)'], color = 'orange' )
+plt.xlabel("Hololive Generations", fontsize=12)
+plt.ylabel("Youtube Subscription Count", fontsize=13)
+plt.title("Total Subscription Count for each Generation", fontsize=15)
+plt.xticks(rotation=90, ha='right')
+plt.title("Total Subscribers per Generation")
+plt.savefig("barchart_subscriptions_matplotlib.png")
+plt.show()
+ 
+#grouping the Hololive members by generation
+hololive_pie = hololive_sdf.groupby('group').count().sort('group').toPandas()
+#creating a pie chart to show the breakdown in superchats within Hololive
+fig = plt.figure()
+plt.pie(hololive_pie['count'], labels = hololive_pie['group'], autopct='%1.1f%%')
+plt.title("Hololive Superchat Breakdown", fontsize=15)
+plt.xticks(rotation=90, ha='right')
+fig.tight_layout()
+plt.savefig("piechart_superchats_matplotlib.png")
+plt.show()
